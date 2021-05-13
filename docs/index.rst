@@ -48,6 +48,8 @@ Contents
     advanced_user_guide/index
     tutorials_examples
     technical_specs/index
+    related_packages/index
+    faq
     license
     copyright
 
