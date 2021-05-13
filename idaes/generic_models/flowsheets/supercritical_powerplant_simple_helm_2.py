@@ -33,12 +33,14 @@ __author__ = "Naresh Susarla, Andres J Calderon, Miguel Zamarripa"
 
 # Import Pyomo libraries
 import pyomo.environ as pyo
+from pyomo.environ import units as pyunits
 from pyomo.network import Arc
 from pyomo.environ import units
 
 # Import IDAES libraries
 from idaes.core import FlowsheetBlock, MaterialBalanceType
 from idaes.core.util import copy_port_values as _set_port
+# from idaes.core.util import get_solver
 from idaes.core.util.model_statistics import degrees_of_freedom
 from idaes.generic_models.unit_models import (
     # Mixer,
@@ -72,24 +74,37 @@ def create_model():
     ###########################################################################
     m = pyo.ConcreteModel(name="Steam Cycle Model")
     m.fs = FlowsheetBlock(default={"dynamic": False})
-    m.fs.prop_water = iapws95.Iapws95ParameterBlock(
-        default={"phase_presentation": iapws95.PhaseType.LG}
-    )
-
-    m.fs.prop_water2 = iapws95.Iapws95ParameterBlock()
+    m.fs.prop_water = iapws95.Iapws95ParameterBlock()
 
     ###########################################################################
     #   Turbine declarations                                   #
     ###########################################################################
 
-    for i in range(9):
-
-        turbine = HelmTurbineStage(
-            default={
-                "property_package": m.fs.prop_water2
-                }
+    m.turbines_set = pyo.RangeSet(9)
+    m.fs.turbines = HelmTurbineStage(
+        m.turbines_set,
+        default={   "property_package": m.fs.prop_water}
         )
-        setattr(m.fs, "turbine_" + str(i+1), turbine)
+
+    ###########################################################################
+    #  Turbine outlet splitter constraints                                    #
+    ###########################################################################
+    # The default number of outlets for a splitter is 2. This can be changed
+    # using the "num_outlets" argument.
+    # In the SCPP flowsheet turbine_splitter[4] has 3 outlets. This is realized
+    # by using the 'initialize' argument as shown below.
+    m.turbine_slitters_set = pyo.RangeSet(8)
+    m.fs.turbine_splitters = HelmSplitter(
+        m.turbine_slitters_set, 
+        default={   "dynamic": False,
+                    "property_package": m.fs.prop_water,
+                    },
+        initialize = {
+            4: {
+                "property_package": m.fs.prop_water,
+                "num_outlets": 3
+            },
+        })
 
     ###########################################################################
     #  Boiler section declarations:                                #
@@ -112,52 +127,32 @@ def create_model():
         }
     )
 
-    # Outlet temperature of boiler is set to 866.15 K
-    @m.fs.boiler.Constraint(m.fs.time)
-    def boiler_temperature_constraint(b, t):
-        return b.control_volume.properties_out[t].temperature == 866.15  # K
-
-    # Outlet temperature of reheater is set to 866.15 K
-    @m.fs.reheater.Constraint(m.fs.time)
-    def reheater_temperature_constraint(b, t):
-        return b.control_volume.properties_out[t].temperature == 866.15  # K
-
     ###########################################################################
     #  Add Condenser Mixer, Condenser, and Condensate pump                    #
     ###########################################################################
     # condenser mix
     m.fs.condenser_mix = Mixer(
         default={
-            "momentum_mixing_type": MomentumMixingType.none,
+            "momentum_mixing_type": MomentumMixingType.minimize,
             "inlet_list": ["main", "bfpt", "drain", "makeup"],
             "property_package": m.fs.prop_water,
         }
     )
 
     # The inlet 'main' refers to the main steam coming from the turbine train
-    # Inlet 'bfpt' refers to the steam coming from the bolier feed pump turbine
+    # Inlet 'bfpt' refers to the steam coming from the boiler feed pump turbine
     # Inlet 'drain' refers to the condensed steam from the feed water heater 1
     # Inlet 'makeup' refers to the make up water
-    # The outlet pressure of condenser mixer is equal to the minimum pressure
-    # Since the turbine (#9) outlet (or, mixer inlet 'main') pressure
-    # has the minimum pressure, the following constraint sets the outlet
-    # pressure of the condenser mixer to the pressure of the inlet 'main'
-    @m.fs.condenser_mix.Constraint(m.fs.time)
-    def mixer_pressure_constraint(b, t):
-        return b.main_state[t].pressure == b.mixed_state[t].pressure
 
     m.fs.condenser = CondenserHelm(default={"shell":{"has_pressure_change": False,
-                                            "property_package": m.fs.prop_water2},
-                                    "tube": {"has_pressure_change": False,
-                                            "property_package": m.fs.prop_water2}})
+                                            "property_package": m.fs.prop_water},
+                                            "tube": {"has_pressure_change": False,
+                                            "property_package": m.fs.prop_water}})
     
-    iscale.set_scaling_factor(m.fs.condenser.side_1.heat, 1e-9)
-    iscale.set_scaling_factor(m.fs.condenser.side_2.heat, 1e-9)
-
     # condensate pump
     m.fs.cond_pump = WaterPump(
         default={
-            "property_package": m.fs.prop_water2,
+            "property_package": m.fs.prop_water,
         }
     )
     ###########################################################################
@@ -193,40 +188,24 @@ def create_model():
     ###########################################################################
     # DEFINITION OF FEED WATER HEATERS MIXERS
     ###########################################################################
-    FWH_Mixers_list = ['fwh1_mix', 'fwh2_mix', 'fwh3_mix', 'fwh6_mix', 'fwh7_mix']
+    m.fwh_mixers_set = pyo.Set(initialize=[1, 2, 3, 6, 7])
 
-    for i in FWH_Mixers_list:
-        FWH_Mixer = Mixer(
+    m.fs.fwh_mixers = Mixer(
+            m.fwh_mixers_set,
             default={
-                "momentum_mixing_type": MomentumMixingType.none,
+                "momentum_mixing_type": MomentumMixingType.minimize,
                 "inlet_list": ["steam", "drain"],
                 "property_package": m.fs.prop_water,
                 }
                 )
-        setattr(m.fs, i, FWH_Mixer)
-
-    ###########################################################################
-    # DEFINITION OF OUTLET PRESSURE OF FEED WATER HEATERS MIXERS
-    ###########################################################################
-
-    # The outlet pressure of an FWH mixer is equal to the minimum pressure
-    # Since the pressure of mixer inlet 'steam' has the minimum pressure,
-    # the following constraints set the outlet pressure of FWH mixers to be same
-    # as the pressure of the inlet 'steam'
-
-    def fwhmixer_pressure_constraint(b, t):
-        return b.steam_state[t].pressure == b.mixed_state[t].pressure
-
-    for i in FWH_Mixers_list:
-        setattr(getattr(m.fs, i), "mixer_pressure_constraint", pyo.Constraint(m.fs.config.time, rule=fwhmixer_pressure_constraint))
 
     ###########################################################################
     # DEFINITION OF FEED WATER HEATERS
     ###########################################################################
-    FWH_list = ['fwh1', 'fwh2', 'fwh3', 'fwh4', 'fwh6', 'fwh7', 'fwh8']
 
-    for i in FWH_list:
-        FWH = HeatExchanger(
+    m.fwh_set = pyo.Set(initialize=[1,2,3,4,6,7,8])
+    m.fs.fwh = HeatExchanger(
+            m.fwh_set,
             default={
                 "delta_temperature_callback": delta_temperature_underwood_callback,
                 "shell": {
@@ -241,16 +220,52 @@ def create_model():
                 },
             }
         )
-        setattr(m.fs, i, FWH)
+  
+    ###########################################################################
+    #  Add deaerator, boiler feed pump (BFP), and pump turbine                           #
+    ###########################################################################
+    m.fs.fwh5_da = Mixer(
+        default={
+            "momentum_mixing_type": MomentumMixingType.minimize,
+            "inlet_list": ["steam", "drain", "feedwater"],
+            "property_package": m.fs.prop_water,
+        }
+    )
+
+    m.fs.bfp = WaterPump(
+        default={
+            "property_package": m.fs.prop_water,
+        }
+    )
+    m.fs.bfpt = HelmTurbineStage(
+        default={
+            "property_package": m.fs.prop_water,
+        }
+    )
+
 
     ###########################################################################
-    # SETTING SCALING FACTORS FOR AREA AND HEAT TRANSFER COEFFICIENT
+    #  Create the stream Arcs and return the model                            #
     ###########################################################################
+    _make_constraints(m)
+    _create_arcs(m)
+    pyo.TransformationFactory("network.expand_arcs").apply_to(m.fs)
+    return m
 
-    for i in FWH_list:
-        c = getattr(m.fs, i)
-        iscale.set_scaling_factor(getattr(c, "area"), 1e-2)
-        iscale.set_scaling_factor(getattr(c, "overall_heat_transfer_coefficient"), 1e-3)
+def _make_constraints(m):
+
+    ###########################################################################
+    #                              BOILER SECTION
+    ###########################################################################
+    # Outlet temperature of boiler is set to 866.15 K
+    @m.fs.boiler.Constraint(m.fs.time)
+    def boiler_temperature_constraint(b, t):
+        return b.control_volume.properties_out[t].temperature == 866.15  # K
+
+    # Outlet temperature of reheater is set to 866.15 K
+    @m.fs.reheater.Constraint(m.fs.time)
+    def reheater_temperature_constraint(b, t):
+        return b.control_volume.properties_out[t].temperature == 866.15  # K
 
     ###########################################################################
     # Setting the outlet enthalpy of condensate in an FWH to be same as saturated liquid
@@ -260,8 +275,8 @@ def create_model():
             b.side_1.properties_out[t].enth_mol
             == b.side_1.properties_out[t].enth_mol_sat_phase['Liq'])
 
-    for i in FWH_list:
-        setattr(getattr(m.fs, i), i + "_vaporfrac_constraint", pyo.Constraint(m.fs.time, rule=fwh_vaporfrac_constraint))
+    for i in m.fwh_set:
+        setattr(m.fs.fwh[i], "fwh_vaporfrac_constraint", pyo.Constraint(m.fs.config.time, rule=fwh_vaporfrac_constraint))
 
     ###########################################################################
     # Setting a 4% pressure drop on the feedwater side (P_out = 0.96 * P_in)
@@ -272,8 +287,8 @@ def create_model():
             b.side_2.properties_out[t].pressure
             == 0.96 * b.side_2.properties_in[t].pressure)
 
-    for i in FWH_list:
-        setattr(getattr(m.fs, i), i + "_s2pdrop_constraint", pyo.Constraint(m.fs.time, rule=fwh_s2pdrop_constraint))
+    for i in m.fwh_set:
+        setattr(m.fs.fwh[i], "fwh_s2pdrop_constraint", pyo.Constraint(m.fs.time, rule=fwh_s2pdrop_constraint))
 
     ###########################################################################
     # Setting the outlet pressure of condensate to be 10% more than that of
@@ -287,53 +302,23 @@ def create_model():
     # FWH7: 0.79^4 is the pressure ratio for turbine #3 (see set_inputs)
     # FWH8: 0.8^2 is the pressure ratio for turbine #2 (see set_inputs)
     
-    pressure_ratio_list = {  'fwh1': 0.5,
-                        'fwh2': 0.64**2,
-                        'fwh3': 0.64**2,
-                        'fwh4': 0.64**2,
-                        'fwh6': 0.79**6,
-                        'fwh7': 0.79**4,
-                        'fwh8': 0.8**2}
+    pressure_ratio_list = {  1: 0.5,
+                        2: 0.64**2,
+                        3: 0.64**2,
+                        4: 0.64**2,
+                        6: 0.79**6,
+                        7: 0.79**4,
+                        8: 0.8**2}
     
     def fwh_s1pdrop_constraint(b, t):
         return (
             b.side_1.properties_out[t].pressure
             == 1.1 * b.turbine_pressure_ratio * b.side_1.properties_in[t].pressure)
 
-    for i in FWH_list:
-        b = getattr(m.fs, i)
+    for i in m.fwh_set:
+        b = m.fs.fwh[i]
         b.turbine_pressure_ratio = pyo.Param(initialize = pressure_ratio_list[i])
-        setattr(b, i+"_s1pdrop_constraint", pyo.Constraint(m.fs.config.time, rule=fwh_s1pdrop_constraint))
-
-    ###########################################################################
-    #  Add deaerator and boiler feed pump (BFP)                               #
-    ###########################################################################
-    m.fs.fwh5_da = Mixer(
-        default={
-            "momentum_mixing_type": MomentumMixingType.none,
-            "inlet_list": ["steam", "drain", "feedwater"],
-            "property_package": m.fs.prop_water,
-        }
-    )
-
-    # The outlet pressure of deaerator is equal to the minimum pressure
-    # Since the pressure of deaerator inlet 'feedwater' has
-    # the minimum pressure, the following constraint sets the outlet pressure
-    # of deaerator to be same as the pressure of the inlet 'feedwater'
-    @m.fs.fwh5_da.Constraint(m.fs.time)
-    def fwh5mixer_pressure_constraint(b, t):
-        return b.feedwater_state[t].pressure == b.mixed_state[t].pressure
-
-    m.fs.bfp = WaterPump(
-        default={
-            "property_package": m.fs.prop_water2,
-        }
-    )
-    m.fs.bfpt = HelmTurbineStage(
-        default={
-            "property_package": m.fs.prop_water2,
-        }
-    )
+        setattr(b, "fwh_s1pdrop_constraint", pyo.Constraint(m.fs.config.time, rule=fwh_s1pdrop_constraint))
 
     # The following constraint sets the outlet pressure of steam extracted
     # for boiler feed water turbine to be same as that of condenser
@@ -354,38 +339,55 @@ def create_model():
             b.bfp.control_volume.work[t] + b.bfpt.control_volume.work[t]
             == 0
         )
-
-    ###########################################################################
-    #  Turbine outlet splitter constraints                                    #
-    ###########################################################################
-    # Equality constraints have been written as following to define
-    # the split fractions within the turbine train
-
-    splitter_list = ['t1_splitter', 't2_splitter', 't3_splitter', 't5_splitter', 't6_splitter', 't7_splitter', 't8_splitter']
-
-    for i in splitter_list:
-
-        Splitter = HelmSplitter(default={"dynamic": False,
-                                        "property_package": m.fs.prop_water})
-        setattr(m.fs, i, Splitter)
     
-    m.fs.t4_splitter = HelmSplitter(default={"dynamic": False,
-                                            "property_package": m.fs.prop_water,
-                                            "num_outlets": 3})
-
     ###########################################################################
-    #  Create the stream Arcs and return the model                            #
+    #                       OUTPUT POWER AND PLANT HEAT DUTY
     ###########################################################################
-    _create_arcs(m)
-    pyo.TransformationFactory("network.expand_arcs").apply_to(m.fs)
-    return m
 
+    # The power plant with storage for a charge scenario is now ready
+    # Declaring variables for plant power out and plant heat duty for easy analysis of various
+    # design and operating scenarios
+    m.fs.plant_power_out = pyo.Var(
+        m.fs.time,
+        domain=pyo.Reals,
+        initialize=620,
+        doc="Net Power MWe out from the power plant",
+        units=pyunits.MW
+    )
+
+    m.fs.plant_heat_duty = pyo.Var(
+        m.fs.time,
+        domain=pyo.Reals,
+        initialize=600,
+        doc="Net Power MWe out from the power plant",
+        units=pyunits.MW
+    )
+
+    #   Constraint on Plant Power Output
+    #   Plant Power Out = Turbine Power - Power required for HX Pump
+    @m.fs.Constraint(m.fs.time)
+    def production_cons(b, t):
+
+        return (
+            -1*sum(m.fs.turbines[i].work_mechanical[t] for i in m.turbines_set) * 1e-6
+            == m.fs.plant_power_out[t]
+        )
+    
+    #   Constraint on Plant Heat Duty
+    #   Plant Heat Duty = Boiler + Reheater
+    @m.fs.Constraint(m.fs.time)
+    def heatduty_cons(b, t):
+
+        return (
+            sum(unit.heat_duty[t] for unit in [m.fs.boiler, m.fs.reheater]) * 1e-6
+            == m.fs.plant_heat_duty[t]
+        )
 
 def _create_arcs(m):
 
     # boiler to turb
     m.fs.boiler_to_turb1 = Arc(
-        source=m.fs.boiler.outlet, destination=m.fs.turbine_1.inlet
+        source=m.fs.boiler.outlet, destination=m.fs.turbines[1].inlet
     )
 
     ###########################################################################
@@ -394,17 +396,17 @@ def _create_arcs(m):
 
     # Turbine 1 to splitter
     m.fs.turb1_to_t1split = Arc(
-        source=m.fs.turbine_1.outlet, destination=m.fs.t1_splitter.inlet
+        source=m.fs.turbines[1].outlet, destination=m.fs.turbine_splitters[1].inlet
     )
 
     # Splitter to turbine 2
     m.fs.t1split_to_turb2 = Arc(
-        source=m.fs.t1_splitter.outlet_1, destination=m.fs.turbine_2.inlet
+        source=m.fs.turbine_splitters[1].outlet_1, destination=m.fs.turbines[2].inlet
     )
 
     # Splitter to Feed Water Heater 8
     m.fs.t1split_to_fwh8 = Arc(
-        source=m.fs.t1_splitter.outlet_2, destination=m.fs.fwh8.inlet_1
+        source=m.fs.turbine_splitters[1].outlet_2, destination=m.fs.fwh[8].inlet_1
     )
 
     ###########################################################################
@@ -413,22 +415,22 @@ def _create_arcs(m):
 
     # Turbine 2 to splitter
     m.fs.turb2_to_t2split = Arc(
-        source=m.fs.turbine_2.outlet, destination=m.fs.t2_splitter.inlet
+        source=m.fs.turbines[2].outlet, destination=m.fs.turbine_splitters[2].inlet
     )
 
     # Splitter to reheater
     m.fs.t2split_to_reheater = Arc(
-        source=m.fs.t2_splitter.outlet_1, destination=m.fs.reheater.inlet
+        source=m.fs.turbine_splitters[2].outlet_1, destination=m.fs.reheater.inlet
     )
 
     # Splitter to Feed Water Heater Mix 7
     m.fs.t2split_to_fwh7mix = Arc(
-        source=m.fs.t2_splitter.outlet_2, destination=m.fs.fwh7_mix.steam
+        source=m.fs.turbine_splitters[2].outlet_2, destination=m.fs.fwh_mixers[7].steam
     )
 
     # reheater to turbine 3
     m.fs.reheater_to_turb3 = Arc(
-        source=m.fs.reheater.outlet, destination=m.fs.turbine_3.inlet
+        source=m.fs.reheater.outlet, destination=m.fs.turbines[3].inlet
     )
 
     ###########################################################################
@@ -437,17 +439,17 @@ def _create_arcs(m):
 
     # Turbine 3 to splitter
     m.fs.turb3_to_t3_split = Arc(
-        source=m.fs.turbine_3.outlet, destination=m.fs.t3_splitter.inlet
+        source=m.fs.turbines[3].outlet, destination=m.fs.turbine_splitters[3].inlet
     )
 
     # Splitter to turbine 4
     m.fs.t3split_to_turb4 = Arc(
-        source=m.fs.t3_splitter.outlet_1, destination=m.fs.turbine_4.inlet
+        source=m.fs.turbine_splitters[3].outlet_1, destination=m.fs.turbines[4].inlet
     )
 
     # Splitter to Feed Water Heater Mix 6
     m.fs.t3split_to_fhw6mix = Arc(
-        source=m.fs.t3_splitter.outlet_2, destination=m.fs.fwh6_mix.steam
+        source=m.fs.turbine_splitters[3].outlet_2, destination=m.fs.fwh_mixers[6].steam
     )
 
     ###########################################################################
@@ -456,22 +458,22 @@ def _create_arcs(m):
 
     # Turbine 4 to splitter
     m.fs.turb4_to_t4_split = Arc(
-        source=m.fs.turbine_4.outlet, destination=m.fs.t4_splitter.inlet
+        source=m.fs.turbines[4].outlet, destination=m.fs.turbine_splitters[4].inlet
     )
 
     # Splitter to turbine 5
     m.fs.t4split_to_turb5 = Arc(
-        source=m.fs.t4_splitter.outlet_1, destination=m.fs.turbine_5.inlet
+        source=m.fs.turbine_splitters[4].outlet_1, destination=m.fs.turbines[5].inlet
     )
 
     # Splitter to deareator FWH5_da
     m.fs.t4split_to_fhw5da = Arc(
-        source=m.fs.t4_splitter.outlet_2, destination=m.fs.fwh5_da.steam
+        source=m.fs.turbine_splitters[4].outlet_2, destination=m.fs.fwh5_da.steam
     )
 
     # Splitter to bfpt
     m.fs.t4split_to_bfpt = Arc(
-        source=m.fs.t4_splitter.outlet_3, destination=m.fs.bfpt.inlet
+        source=m.fs.turbine_splitters[4].outlet_3, destination=m.fs.bfpt.inlet
     )
 
     ###########################################################################
@@ -480,17 +482,17 @@ def _create_arcs(m):
 
     # Turbine 5 to splitter
     m.fs.turb5_to_t5_split = Arc(
-        source=m.fs.turbine_5.outlet, destination=m.fs.t5_splitter.inlet
+        source=m.fs.turbines[5].outlet, destination=m.fs.turbine_splitters[5].inlet
     )
 
     # Splitter to turbine 6
     m.fs.t5split_to_turb6 = Arc(
-        source=m.fs.t5_splitter.outlet_1, destination=m.fs.turbine_6.inlet
+        source=m.fs.turbine_splitters[5].outlet_1, destination=m.fs.turbines[6].inlet
     )
 
     # Splitter to Feed Water Heater 4
     m.fs.t5split_to_fwh4 = Arc(
-        source=m.fs.t5_splitter.outlet_2, destination=m.fs.fwh4.inlet_1
+        source=m.fs.turbine_splitters[5].outlet_2, destination=m.fs.fwh[4].inlet_1
     )
 
     ###########################################################################
@@ -499,17 +501,17 @@ def _create_arcs(m):
    
     # Turbine 6 to splitter
     m.fs.turb6_to_t6_split = Arc(
-        source=m.fs.turbine_6.outlet, destination=m.fs.t6_splitter.inlet
+        source=m.fs.turbines[6].outlet, destination=m.fs.turbine_splitters[6].inlet
     )
 
     # Splitter to turbine 7
     m.fs.t6split_to_turb7 = Arc(
-        source=m.fs.t6_splitter.outlet_1, destination=m.fs.turbine_7.inlet
+        source=m.fs.turbine_splitters[6].outlet_1, destination=m.fs.turbines[7].inlet
     )
 
     # Splitter to Feed Water Heater Mixer 3
     m.fs.t6split_to_fwh3mix = Arc(
-        source=m.fs.t6_splitter.outlet_2, destination=m.fs.fwh3_mix.steam
+        source=m.fs.turbine_splitters[6].outlet_2, destination=m.fs.fwh_mixers[3].steam
     )
 
     ###########################################################################
@@ -518,17 +520,17 @@ def _create_arcs(m):
    
     # Turbine 7 to splitter
     m.fs.turb7_to_t7_split = Arc(
-        source=m.fs.turbine_7.outlet, destination=m.fs.t7_splitter.inlet
+        source=m.fs.turbines[7].outlet, destination=m.fs.turbine_splitters[7].inlet
     )
 
     # Splitter to turbine 8
     m.fs.t7split_to_turb8 = Arc(
-        source=m.fs.t7_splitter.outlet_1, destination=m.fs.turbine_8.inlet
+        source=m.fs.turbine_splitters[7].outlet_1, destination=m.fs.turbines[8].inlet
     )
 
     # Splitter to Feed Water Heater Mixer 2
     m.fs.t7split_to_fwh2mix = Arc(
-        source=m.fs.t7_splitter.outlet_2, destination=m.fs.fwh2_mix.steam
+        source=m.fs.turbine_splitters[7].outlet_2, destination=m.fs.fwh_mixers[2].steam
     )
 
     ###########################################################################
@@ -537,17 +539,17 @@ def _create_arcs(m):
    
     # Turbine 8 to splitter
     m.fs.turb8_to_t8_split = Arc(
-        source=m.fs.turbine_8.outlet, destination=m.fs.t8_splitter.inlet
+        source=m.fs.turbines[8].outlet, destination=m.fs.turbine_splitters[8].inlet
     )
 
     # Splitter to turbine 9
     m.fs.t8split_to_turb9 = Arc(
-        source=m.fs.t8_splitter.outlet_1, destination=m.fs.turbine_9.inlet
+        source=m.fs.turbine_splitters[8].outlet_1, destination=m.fs.turbines[9].inlet
     )
 
     # Splitter to Feed Water Heater Mixer 1
     m.fs.t8split_to_fwh1mix = Arc(
-        source=m.fs.t8_splitter.outlet_2, destination=m.fs.fwh1_mix.steam
+        source=m.fs.turbine_splitters[8].outlet_2, destination=m.fs.fwh_mixers[1].steam
     )
 
     ###########################################################################
@@ -555,11 +557,11 @@ def _create_arcs(m):
     ###########################################################################
 
     m.fs.turb_to_cmix = Arc(
-        source=m.fs.turbine_9.outlet, destination=m.fs.condenser_mix.main
+        source=m.fs.turbines[9].outlet, destination=m.fs.condenser_mix.main
     )
     # condenser to FWHs
     m.fs.drain_to_cmix = Arc(
-        source=m.fs.fwh1.outlet_1, destination=m.fs.condenser_mix.drain
+        source=m.fs.fwh[1].outlet_1, destination=m.fs.condenser_mix.drain
     )
     m.fs.bfpt_to_cmix = Arc(
         source=m.fs.bfpt.outlet, destination=m.fs.condenser_mix.bfpt
@@ -573,73 +575,72 @@ def _create_arcs(m):
     )
 
     m.fs.pump_to_fwh1 = Arc(
-        source=m.fs.cond_pump.outlet, destination=m.fs.fwh1.inlet_2
+        source=m.fs.cond_pump.outlet, destination=m.fs.fwh[1].inlet_2
     )
     # Mixer to FWHs
     m.fs.mix1_to_fwh1 = Arc(
-        source=m.fs.fwh1_mix.outlet, destination=m.fs.fwh1.inlet_1
+        source=m.fs.fwh_mixers[1].outlet, destination=m.fs.fwh[1].inlet_1
     )
     m.fs.mix2_to_fwh2 = Arc(
-        source=m.fs.fwh2_mix.outlet, destination=m.fs.fwh2.inlet_1
+        source=m.fs.fwh_mixers[2].outlet, destination=m.fs.fwh[2].inlet_1
     )
     m.fs.mix3_to_fwh3 = Arc(
-        source=m.fs.fwh3_mix.outlet, destination=m.fs.fwh3.inlet_1
+        source=m.fs.fwh_mixers[3].outlet, destination=m.fs.fwh[3].inlet_1
     )
     m.fs.mix6_to_fwh6 = Arc(
-        source=m.fs.fwh6_mix.outlet, destination=m.fs.fwh6.inlet_1
+        source=m.fs.fwh_mixers[6].outlet, destination=m.fs.fwh[6].inlet_1
     )
     m.fs.mix7_to_fwh7 = Arc(
-        source=m.fs.fwh7_mix.outlet, destination=m.fs.fwh7.inlet_1
+        source=m.fs.fwh_mixers[7].outlet, destination=m.fs.fwh[7].inlet_1
     )
     # Drains to Mixers
     m.fs.fwh2_to_fwh1mix = Arc(
-        source=m.fs.fwh2.outlet_1, destination=m.fs.fwh1_mix.drain
+        source=m.fs.fwh[2].outlet_1, destination=m.fs.fwh_mixers[1].drain
     )
     m.fs.fwh3_to_fwh2mix = Arc(
-        source=m.fs.fwh3.outlet_1, destination=m.fs.fwh2_mix.drain
+        source=m.fs.fwh[3].outlet_1, destination=m.fs.fwh_mixers[2].drain
     )
     m.fs.fwh4_to_fwh3mix = Arc(
-        source=m.fs.fwh4.outlet_1, destination=m.fs.fwh3_mix.drain
+        source=m.fs.fwh[4].outlet_1, destination=m.fs.fwh_mixers[3].drain
     )
     m.fs.fwh6_to_fwh5mix = Arc(
-        source=m.fs.fwh6.outlet_1, destination=m.fs.fwh5_da.drain
+        source=m.fs.fwh[6].outlet_1, destination=m.fs.fwh5_da.drain
     )
     m.fs.fwh7_to_fwh6mix = Arc(
-        source=m.fs.fwh7.outlet_1, destination=m.fs.fwh6_mix.drain
+        source=m.fs.fwh[7].outlet_1, destination=m.fs.fwh_mixers[6].drain
     )
     m.fs.fwh8_to_fwh7mix = Arc(
-        source=m.fs.fwh8.outlet_1, destination=m.fs.fwh7_mix.drain
+        source=m.fs.fwh[8].outlet_1, destination=m.fs.fwh_mixers[7].drain
     )
     # Outlet2 to Inlet2
     m.fs.fwh1_to_fwh2 = Arc(
-        source=m.fs.fwh1.outlet_2, destination=m.fs.fwh2.inlet_2
+        source=m.fs.fwh[1].outlet_2, destination=m.fs.fwh[2].inlet_2
     )
     m.fs.fwh2_to_fwh3 = Arc(
-        source=m.fs.fwh2.outlet_2, destination=m.fs.fwh3.inlet_2
+        source=m.fs.fwh[2].outlet_2, destination=m.fs.fwh[3].inlet_2
     )
     m.fs.fwh3_to_fwh4 = Arc(
-        source=m.fs.fwh3.outlet_2, destination=m.fs.fwh4.inlet_2
+        source=m.fs.fwh[3].outlet_2, destination=m.fs.fwh[4].inlet_2
     )
     m.fs.fwh4_to_fwh5 = Arc(
-        source=m.fs.fwh4.outlet_2, destination=m.fs.fwh5_da.feedwater
+        source=m.fs.fwh[4].outlet_2, destination=m.fs.fwh5_da.feedwater
     )
     m.fs.fwh5_to_bfp = Arc(
         source=m.fs.fwh5_da.outlet, destination=m.fs.bfp.inlet
     )
     m.fs.bfp_to_fwh6 = Arc(
-        source=m.fs.bfp.outlet, destination=m.fs.fwh6.inlet_2
+        source=m.fs.bfp.outlet, destination=m.fs.fwh[6].inlet_2
     )
     m.fs.fwh6_to_fwh7 = Arc(
-        source=m.fs.fwh6.outlet_2, destination=m.fs.fwh7.inlet_2
+        source=m.fs.fwh[6].outlet_2, destination=m.fs.fwh[7].inlet_2
     )
     m.fs.fwh7_to_fwh8 = Arc(
-        source=m.fs.fwh7.outlet_2, destination=m.fs.fwh8.inlet_2
+        source=m.fs.fwh[7].outlet_2, destination=m.fs.fwh[8].inlet_2
     )
     # FWH8 to Boiler to Turbine
     m.fs.fwh8_to_boiler = Arc(
-        source=m.fs.fwh8.outlet_2, destination=m.fs.boiler.inlet
+        source=m.fs.fwh[8].outlet_2, destination=m.fs.boiler.inlet
     )
-
 
 def set_model_input(m):
 
@@ -664,32 +665,32 @@ def set_model_input(m):
 
     # The efficiency and pressure ratios of all turbines were assumed
     # based on results for the baseline scenario
-    m.fs.turbine_1.ratioP.fix(0.8**5)
-    m.fs.turbine_1.efficiency_isentropic.fix(0.94)
+    m.fs.turbines[1].ratioP.fix(0.8**5)
+    m.fs.turbines[1].efficiency_isentropic.fix(0.94)
 
-    m.fs.turbine_2.ratioP.fix(0.8**2)
-    m.fs.turbine_2.efficiency_isentropic.fix(0.94)
+    m.fs.turbines[2].ratioP.fix(0.8**2)
+    m.fs.turbines[2].efficiency_isentropic.fix(0.94)
 
-    m.fs.turbine_3.ratioP.fix(0.79**4)
-    m.fs.turbine_3.efficiency_isentropic.fix(0.88)
+    m.fs.turbines[3].ratioP.fix(0.79**4)
+    m.fs.turbines[3].efficiency_isentropic.fix(0.88)
 
-    m.fs.turbine_4.ratioP.fix(0.79**6)
-    m.fs.turbine_4.efficiency_isentropic.fix(0.88)
+    m.fs.turbines[4].ratioP.fix(0.79**6)
+    m.fs.turbines[4].efficiency_isentropic.fix(0.88)
 
-    m.fs.turbine_5.ratioP.fix(0.64**2)
-    m.fs.turbine_5.efficiency_isentropic.fix(0.78)
+    m.fs.turbines[5].ratioP.fix(0.64**2)
+    m.fs.turbines[5].efficiency_isentropic.fix(0.78)
 
-    m.fs.turbine_6.ratioP.fix(0.64**2)
-    m.fs.turbine_6.efficiency_isentropic.fix(0.78)
+    m.fs.turbines[6].ratioP.fix(0.64**2)
+    m.fs.turbines[6].efficiency_isentropic.fix(0.78)
 
-    m.fs.turbine_7.ratioP.fix(0.64**2)
-    m.fs.turbine_7.efficiency_isentropic.fix(0.78)
+    m.fs.turbines[7].ratioP.fix(0.64**2)
+    m.fs.turbines[7].efficiency_isentropic.fix(0.78)
 
-    m.fs.turbine_8.ratioP.fix(0.64**2)
-    m.fs.turbine_8.efficiency_isentropic.fix(0.78)
+    m.fs.turbines[8].ratioP.fix(0.64**2)
+    m.fs.turbines[8].efficiency_isentropic.fix(0.78)
 
-    m.fs.turbine_9.ratioP.fix(0.5)
-    m.fs.turbine_9.efficiency_isentropic.fix(0.78)
+    m.fs.turbines[9].ratioP.fix(0.5)
+    m.fs.turbines[9].efficiency_isentropic.fix(0.78)
 
     ###########################################################################
     #  Condenser section                                         #
@@ -712,17 +713,17 @@ def set_model_input(m):
     #  Low pressure FWH section inputs                                        #
     ###########################################################################
     # fwh1
-    m.fs.fwh1.area.fix(400)
-    m.fs.fwh1.overall_heat_transfer_coefficient.fix(2000)
+    m.fs.fwh[1].area.fix(400)
+    m.fs.fwh[1].overall_heat_transfer_coefficient.fix(2000)
     # fwh2
-    m.fs.fwh2.area.fix(300)
-    m.fs.fwh2.overall_heat_transfer_coefficient.fix(2900)
+    m.fs.fwh[2].area.fix(300)
+    m.fs.fwh[2].overall_heat_transfer_coefficient.fix(2900)
     # fwh3
-    m.fs.fwh3.area.fix(200)
-    m.fs.fwh3.overall_heat_transfer_coefficient.fix(2900)
+    m.fs.fwh[3].area.fix(200)
+    m.fs.fwh[3].overall_heat_transfer_coefficient.fix(2900)
     # fwh4
-    m.fs.fwh4.area.fix(200)
-    m.fs.fwh4.overall_heat_transfer_coefficient.fix(2900)
+    m.fs.fwh[4].area.fix(200)
+    m.fs.fwh[4].overall_heat_transfer_coefficient.fix(2900)
 
     ###########################################################################
     #  Deaerator and boiler feed pump (BFP) Input                             #
@@ -732,7 +733,7 @@ def set_model_input(m):
     # to the deaerator is fixed in this model. The value of this split fraction
     # is again based on the baseline results
 
-    m.fs.t4_splitter.split_fraction[:, "outlet_2"].fix(0.050331)
+    m.fs.turbine_splitters[4].split_fraction[:, "outlet_2"].fix(0.050331)
 
     m.fs.bfp.efficiency_isentropic.fix(0.80)
     # BFW Pump pressure is assumed to be 15% more than
@@ -744,19 +745,124 @@ def set_model_input(m):
     #  High pressure feedwater heater                                         #
     ###########################################################################
     # fwh6
-    m.fs.fwh6.area.fix(600)
-    m.fs.fwh6.overall_heat_transfer_coefficient.fix(2900)
+    m.fs.fwh[6].area.fix(600)
+    m.fs.fwh[6].overall_heat_transfer_coefficient.fix(2900)
     # fwh7
-    m.fs.fwh7.area.fix(400)
-    m.fs.fwh7.overall_heat_transfer_coefficient.fix(2900)
+    m.fs.fwh[7].area.fix(400)
+    m.fs.fwh[7].overall_heat_transfer_coefficient.fix(2900)
     # fwh8
-    m.fs.fwh8.area.fix(400)
-    m.fs.fwh8.overall_heat_transfer_coefficient.fix(2900)
+    m.fs.fwh[8].area.fix(400)
+    m.fs.fwh[8].overall_heat_transfer_coefficient.fix(2900)
 
+def set_scaling_factors(m):  
 
-def initialize(m, fileinput=None, outlvl=idaeslog.NOTSET):
+    ###########################################################################
+    # SETTING SCALING FACTORS FOR FEED WATER HEATERS
+    ###########################################################################
+
+    for i in m.fwh_set:
+        b = m.fs.fwh[i]
+        iscale.set_scaling_factor(b.area, 1e-2)
+        iscale.set_scaling_factor(b.overall_heat_transfer_coefficient, 1e-3)
+        iscale.set_scaling_factor(b.shell.heat, 1e-6)
+        iscale.set_scaling_factor(b.tube.heat, 1e-6)
+    
+    ###########################################################################
+    # SETTING SCALING FACTORS FOR TURBINES
+    ###########################################################################
+
+    for i in m.turbines_set:
+        b = m.fs.turbines[i]
+        iscale.set_scaling_factor(b.control_volume.work, 1e-6)
+
+    iscale.set_scaling_factor(m.fs.boiler.control_volume.heat, 1e-6)
+    iscale.set_scaling_factor(m.fs.reheater.control_volume.heat, 1e-6)
+    iscale.set_scaling_factor(m.fs.condenser.side_1.heat, 1e-9)
+    iscale.set_scaling_factor(m.fs.condenser.side_2.heat, 1e-9)
+    iscale.set_scaling_factor(m.fs.cond_pump.control_volume.work, 1e-6)
+    iscale.set_scaling_factor(m.fs.bfp.control_volume.work, 1e-6)
+    iscale.set_scaling_factor(m.fs.bfpt.control_volume.work, 1e-6)
 
     iscale.calculate_scaling_factors(m)
+
+def set_bounds(m):
+    m.flow_max = 29111 * 1.2
+
+    for unit in [   m.fs.boiler, m.fs.reheater,
+                    m.fs.cond_pump, m.fs.bfp, m.fs.bfpt]:
+        unit.inlet.flow_mol[:].setlb(0)  # mol/s
+        unit.inlet.flow_mol[:].setub(m.flow_max)  # mol/s
+        unit.outlet.flow_mol[:].setlb(0)  # mol/s
+        unit.outlet.flow_mol[:].setub(m.flow_max)  # mol/s
+
+    for i in m.turbines_set:
+        b = m.fs.turbines[i]
+        b.inlet.flow_mol[:].setlb(0)
+        b.inlet.flow_mol[:].setub(m.flow_max)
+        b.outlet.flow_mol[:].setlb(0)
+        b.outlet.flow_mol[:].setub(m.flow_max)
+    
+    for i in m.fwh_mixers_set:
+        b = m.fs.fwh_mixers[i]
+        b.steam.flow_mol[:].setlb(0)
+        b.steam.flow_mol[:].setub(m.flow_max)
+        b.drain.flow_mol[:].setlb(0)
+        b.drain.flow_mol[:].setub(m.flow_max)
+    
+    for i in m.turbine_slitters_set:
+        b = m.fs.turbine_splitters[i]
+        b.split_fraction[0.0, "outlet_1"].setlb(0)
+        b.split_fraction[0.0, "outlet_1"].setub(1)
+        b.split_fraction[0.0, "outlet_2"].setlb(0)
+        b.split_fraction[0.0, "outlet_2"].setub(1)
+    
+    for i in m.fwh_set:
+        b = m.fs.fwh[i]
+        b.inlet_1.flow_mol[:].setlb(0)
+        b.inlet_1.flow_mol[:].setub(m.flow_max)
+        b.inlet_2.flow_mol[:].setlb(0)
+        b.inlet_2.flow_mol[:].setub(m.flow_max)
+        b.outlet_1.flow_mol[:].setlb(0)
+        b.outlet_1.flow_mol[:].setub(m.flow_max)
+        b.outlet_2.flow_mol[:].setlb(0)
+        b.outlet_2.flow_mol[:].setub(m.flow_max)
+
+    m.fs.fwh5_da.feedwater.flow_mol[:].setlb(0)
+    m.fs.fwh5_da.feedwater.flow_mol[:].setub(m.flow_max)
+    m.fs.condenser_mix.main.flow_mol[:].setlb(0)
+    m.fs.condenser_mix.main.flow_mol[:].setub(m.flow_max)
+    m.fs.condenser_mix.bfpt.flow_mol[:].setlb(0)
+    m.fs.condenser_mix.bfpt.flow_mol[:].setub(m.flow_max)
+    m.fs.condenser_mix.drain.flow_mol[:].setlb(0)
+    m.fs.condenser_mix.drain.flow_mol[:].setub(m.flow_max)
+    # m.fs.condenser_mix.makeup.flow_mol[:].setlb(0)
+    m.fs.condenser_mix.makeup.flow_mol[:].setub(m.flow_max)
+    m.fs.condenser_mix.outlet.flow_mol[:].setlb(0)
+    m.fs.condenser_mix.outlet.flow_mol[:].setub(m.flow_max)
+
+    return m
+
+def build_plant_model(initialize_from_file=None, store_initialization=None):
+
+    # Create a flowsheet, add properties, unit models, and arcs
+    m = create_model()
+
+    # Give all the required inputs to the model
+    set_model_input(m)
+
+    # Assert that the model has no degree of freedom at this point
+    assert degrees_of_freedom(m) == 0
+
+    # set scaling factors
+    set_scaling_factors(m)
+
+    # Add bounds only in optimization mode
+    if degrees_of_freedom(m) >= 1:
+        set_bounds(m)
+
+    return m
+
+def initialize(m, fileinput=None, outlvl=idaeslog.NOTSET, solver=None, optarg=None):
 
     solver = pyo.SolverFactory("ipopt")
     solver.options = {
@@ -764,6 +870,8 @@ def initialize(m, fileinput=None, outlvl=idaeslog.NOTSET):
         "max_iter": 300,
         "halt_on_ampl_error": "yes",
     }
+
+    # solver = get_solver(solver, optarg)
 
     # initializing the boiler
     m.fs.boiler.inlet.pressure.fix(24657896)
@@ -780,88 +888,88 @@ def initialize(m, fileinput=None, outlvl=idaeslog.NOTSET):
     # These split fractions will be unfixed later and the constraints will
     # be activated
 
-    m.fs.t1_splitter.split_fraction[:, "outlet_2"].fix(0.12812)
-    m.fs.t2_splitter.split_fraction[:, "outlet_2"].fix(0.061824)
-    m.fs.t3_splitter.split_fraction[:, "outlet_2"].fix(0.03815)
-    m.fs.t4_splitter.split_fraction[:, "outlet_1"].fix(0.9019)
-    m.fs.t5_splitter.split_fraction[:, "outlet_2"].fix(0.0381443)
-    m.fs.t6_splitter.split_fraction[:, "outlet_2"].fix(0.017535)
-    m.fs.t7_splitter.split_fraction[:, "outlet_2"].fix(0.0154)
-    m.fs.t8_splitter.split_fraction[:, "outlet_2"].fix(0.00121)
+    m.fs.turbine_splitters[1].split_fraction[:, "outlet_2"].fix(0.12812)
+    m.fs.turbine_splitters[2].split_fraction[:, "outlet_2"].fix(0.061824)
+    m.fs.turbine_splitters[3].split_fraction[:, "outlet_2"].fix(0.03815)
+    m.fs.turbine_splitters[4].split_fraction[:, "outlet_1"].fix(0.9019)
+    m.fs.turbine_splitters[5].split_fraction[:, "outlet_2"].fix(0.0381443)
+    m.fs.turbine_splitters[6].split_fraction[:, "outlet_2"].fix(0.017535)
+    m.fs.turbine_splitters[7].split_fraction[:, "outlet_2"].fix(0.0154)
+    m.fs.turbine_splitters[8].split_fraction[:, "outlet_2"].fix(0.00121)
 
     m.fs.constraint_out_pressure.deactivate()
-    m.fs.fwh1.fwh1_vaporfrac_constraint.deactivate()
-    m.fs.fwh2.fwh2_vaporfrac_constraint.deactivate()
-    m.fs.fwh3.fwh3_vaporfrac_constraint.deactivate()
-    m.fs.fwh4.fwh4_vaporfrac_constraint.deactivate()
-    m.fs.fwh6.fwh6_vaporfrac_constraint.deactivate()
-    m.fs.fwh7.fwh7_vaporfrac_constraint.deactivate()
-    m.fs.fwh8.fwh8_vaporfrac_constraint.deactivate()
+    m.fs.fwh[1].fwh_vaporfrac_constraint.deactivate()
+    m.fs.fwh[2].fwh_vaporfrac_constraint.deactivate()
+    m.fs.fwh[3].fwh_vaporfrac_constraint.deactivate()
+    m.fs.fwh[4].fwh_vaporfrac_constraint.deactivate()
+    m.fs.fwh[6].fwh_vaporfrac_constraint.deactivate()
+    m.fs.fwh[7].fwh_vaporfrac_constraint.deactivate()
+    m.fs.fwh[8].fwh_vaporfrac_constraint.deactivate()
 
     # solving the turbines and splitters
-    _set_port(m.fs.turbine_1.inlet,  m.fs.boiler.outlet)
-    m.fs.turbine_1.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbines[1].inlet,  m.fs.boiler.outlet)
+    m.fs.turbines[1].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.t1_splitter.inlet,  m.fs.turbine_1.outlet)
-    m.fs.t1_splitter.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbine_splitters[1].inlet,  m.fs.turbines[1].outlet)
+    m.fs.turbine_splitters[1].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.turbine_2.inlet, m.fs.t1_splitter.outlet_1)
-    m.fs.turbine_2.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbines[2].inlet, m.fs.turbine_splitters[1].outlet_1)
+    m.fs.turbines[2].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.t2_splitter.inlet, m.fs.turbine_2.outlet)
-    m.fs.t2_splitter.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbine_splitters[2].inlet, m.fs.turbines[2].outlet)
+    m.fs.turbine_splitters[2].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.reheater.inlet, m.fs.t2_splitter.outlet_1)
+    _set_port(m.fs.reheater.inlet, m.fs.turbine_splitters[2].outlet_1)
     m.fs.reheater.initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.turbine_3.inlet, m.fs.reheater.outlet)
-    m.fs.turbine_3.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbines[3].inlet, m.fs.reheater.outlet)
+    m.fs.turbines[3].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.t3_splitter.inlet, m.fs.turbine_3.outlet)
-    m.fs.t3_splitter.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbine_splitters[3].inlet, m.fs.turbines[3].outlet)
+    m.fs.turbine_splitters[3].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.turbine_4.inlet, m.fs.t3_splitter.outlet_1)
-    m.fs.turbine_4.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbines[4].inlet, m.fs.turbine_splitters[3].outlet_1)
+    m.fs.turbines[4].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.t4_splitter.inlet, m.fs.turbine_4.outlet)
-    m.fs.t4_splitter.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbine_splitters[4].inlet, m.fs.turbines[4].outlet)
+    m.fs.turbine_splitters[4].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.turbine_5.inlet, m.fs.t4_splitter.outlet_1)
-    m.fs.turbine_5.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbines[5].inlet, m.fs.turbine_splitters[4].outlet_1)
+    m.fs.turbines[5].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.t5_splitter.inlet, m.fs.turbine_5.outlet)
-    m.fs.t5_splitter.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbine_splitters[5].inlet, m.fs.turbines[5].outlet)
+    m.fs.turbine_splitters[5].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.turbine_6.inlet, m.fs.t5_splitter.outlet_1)
-    m.fs.turbine_6.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbines[6].inlet, m.fs.turbine_splitters[5].outlet_1)
+    m.fs.turbines[6].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.t6_splitter.inlet, m.fs.turbine_6.outlet)
-    m.fs.t6_splitter.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbine_splitters[6].inlet, m.fs.turbines[6].outlet)
+    m.fs.turbine_splitters[6].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.turbine_7.inlet, m.fs.t6_splitter.outlet_1)
-    m.fs.turbine_7.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbines[7].inlet, m.fs.turbine_splitters[6].outlet_1)
+    m.fs.turbines[7].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.t7_splitter.inlet, m.fs.turbine_7.outlet)
-    m.fs.t7_splitter.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbine_splitters[7].inlet, m.fs.turbines[7].outlet)
+    m.fs.turbine_splitters[7].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.turbine_8.inlet, m.fs.t7_splitter.outlet_1)
-    m.fs.turbine_8.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbines[8].inlet, m.fs.turbine_splitters[7].outlet_1)
+    m.fs.turbines[8].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.t8_splitter.inlet, m.fs.turbine_8.outlet)
-    m.fs.t8_splitter.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbine_splitters[8].inlet, m.fs.turbines[8].outlet)
+    m.fs.turbine_splitters[8].initialize(outlvl=outlvl, optarg=solver.options)
 
-    _set_port(m.fs.turbine_9.inlet, m.fs.t8_splitter.outlet_1)
-    m.fs.turbine_9.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.turbines[9].inlet, m.fs.turbine_splitters[8].outlet_1)
+    m.fs.turbines[9].initialize(outlvl=outlvl, optarg=solver.options)
 
     # initialize the boiler feed pump turbine.
-    _set_port(m.fs.bfpt.inlet, m.fs.t4_splitter.outlet_3)
+    _set_port(m.fs.bfpt.inlet, m.fs.turbine_splitters[4].outlet_3)
     m.fs.bfpt.initialize(outlvl=outlvl, optarg=solver.options)
 
     ###########################################################################
     #  Condenser                                                #
     ###########################################################################
     _set_port(m.fs.condenser_mix.bfpt, m.fs.bfpt.outlet)
-    _set_port(m.fs.condenser_mix.main, m.fs.turbine_9.outlet)
+    _set_port(m.fs.condenser_mix.main, m.fs.turbines[9].outlet)
     m.fs.condenser_mix.drain.flow_mol.fix(1460)
     m.fs.condenser_mix.drain.pressure.fix(7308)
     m.fs.condenser_mix.drain.enth_mol.fix(2973)
@@ -881,59 +989,59 @@ def initialize(m, fileinput=None, outlvl=idaeslog.NOTSET):
     ###########################################################################
 
     # fwh1
-    m.fs.fwh1_mix.drain.flow_mol.fix(1434)
-    m.fs.fwh1_mix.drain.pressure.fix(14617)
-    m.fs.fwh1_mix.drain.enth_mol.fix(3990)
+    m.fs.fwh_mixers[1].drain.flow_mol.fix(1434)
+    m.fs.fwh_mixers[1].drain.pressure.fix(14617)
+    m.fs.fwh_mixers[1].drain.enth_mol.fix(3990)
 
-    _set_port(m.fs.fwh1_mix.steam, m.fs.t8_splitter.outlet_2)
-    m.fs.fwh1_mix.initialize(outlvl=outlvl, optarg=solver.options)
-    m.fs.fwh1_mix.drain.unfix()
+    _set_port(m.fs.fwh_mixers[1].steam, m.fs.turbine_splitters[8].outlet_2)
+    m.fs.fwh_mixers[1].initialize(outlvl=outlvl, optarg=solver.options)
+    m.fs.fwh_mixers[1].drain.unfix()
 
-    _set_port(m.fs.fwh1.inlet_1, m.fs.fwh1_mix.outlet)
-    _set_port(m.fs.fwh1.inlet_2, m.fs.cond_pump.outlet)
-    m.fs.fwh1.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.fwh[1].inlet_1, m.fs.fwh_mixers[1].outlet)
+    _set_port(m.fs.fwh[1].inlet_2, m.fs.cond_pump.outlet)
+    m.fs.fwh[1].initialize(outlvl=outlvl, optarg=solver.options)
 
     # fwh2
-    m.fs.fwh2_mix.drain.flow_mol.fix(1136)
-    m.fs.fwh2_mix.drain.pressure.fix(35685)
-    m.fs.fwh2_mix.drain.enth_mol.fix(5462)
-    _set_port(m.fs.fwh2_mix.steam, m.fs.t7_splitter.outlet_2)
-    m.fs.fwh2_mix.initialize(outlvl=outlvl, optarg=solver.options)
-    m.fs.fwh2_mix.drain.unfix()
-    m.fs.fwh2_mix.steam.unfix()
+    m.fs.fwh_mixers[2].drain.flow_mol.fix(1136)
+    m.fs.fwh_mixers[2].drain.pressure.fix(35685)
+    m.fs.fwh_mixers[2].drain.enth_mol.fix(5462)
+    _set_port(m.fs.fwh_mixers[2].steam, m.fs.turbine_splitters[7].outlet_2)
+    m.fs.fwh_mixers[2].initialize(outlvl=outlvl, optarg=solver.options)
+    m.fs.fwh_mixers[2].drain.unfix()
+    m.fs.fwh_mixers[2].steam.unfix()
 
-    _set_port(m.fs.fwh2.inlet_1, m.fs.fwh2_mix.outlet)
-    _set_port(m.fs.fwh2.inlet_2, m.fs.fwh1.outlet_2)
-    m.fs.fwh2.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.fwh[2].inlet_1, m.fs.fwh_mixers[2].outlet)
+    _set_port(m.fs.fwh[2].inlet_2, m.fs.fwh[1].outlet_2)
+    m.fs.fwh[2].initialize(outlvl=outlvl, optarg=solver.options)
 
     # fwh3
-    m.fs.fwh3_mix.drain.flow_mol.fix(788)
-    m.fs.fwh3_mix.drain.pressure.fix(87123)
-    m.fs.fwh3_mix.drain.enth_mol.fix(7160)
-    _set_port(m.fs.fwh3_mix.steam, m.fs.t6_splitter.outlet_2)
-    m.fs.fwh3_mix.initialize(outlvl=outlvl, optarg=solver.options)
-    m.fs.fwh3_mix.drain.unfix()
+    m.fs.fwh_mixers[3].drain.flow_mol.fix(788)
+    m.fs.fwh_mixers[3].drain.pressure.fix(87123)
+    m.fs.fwh_mixers[3].drain.enth_mol.fix(7160)
+    _set_port(m.fs.fwh_mixers[3].steam, m.fs.turbine_splitters[6].outlet_2)
+    m.fs.fwh_mixers[3].initialize(outlvl=outlvl, optarg=solver.options)
+    m.fs.fwh_mixers[3].drain.unfix()
     # m.fs.fwh3_mix.steam.unfix()
 
-    _set_port(m.fs.fwh3.inlet_1, m.fs.fwh3_mix.outlet)
-    _set_port(m.fs.fwh3.inlet_2, m.fs.fwh2.outlet_2)
-    m.fs.fwh3.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.fwh[3].inlet_1, m.fs.fwh_mixers[3].outlet)
+    _set_port(m.fs.fwh[3].inlet_2, m.fs.fwh[2].outlet_2)
+    m.fs.fwh[3].initialize(outlvl=outlvl, optarg=solver.options)
 
     # fwh4
-    _set_port(m.fs.fwh4.inlet_2, m.fs.fwh3.outlet_2)
-    _set_port(m.fs.fwh4.inlet_1, m.fs.t5_splitter.outlet_2)
-    m.fs.fwh4.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.fwh[4].inlet_2, m.fs.fwh[3].outlet_2)
+    _set_port(m.fs.fwh[4].inlet_1, m.fs.turbine_splitters[5].outlet_2)
+    m.fs.fwh[4].initialize(outlvl=outlvl, optarg=solver.options)
 
     ###########################################################################
     #  boiler feed pump and deaerator                                         #
     ###########################################################################
     # Deaerator
-    _set_port(m.fs.fwh5_da.feedwater, m.fs.fwh4.outlet_2)
+    _set_port(m.fs.fwh5_da.feedwater, m.fs.fwh[4].outlet_2)
     m.fs.fwh5_da.drain.flow_mol[:].fix(6207)
     m.fs.fwh5_da.drain.pressure[:].fix(519291)
     m.fs.fwh5_da.drain.enth_mol[:].fix(11526)
 
-    _set_port(m.fs.fwh5_da.steam, m.fs.t4_splitter.outlet_2)
+    _set_port(m.fs.fwh5_da.steam, m.fs.turbine_splitters[4].outlet_2)
     m.fs.fwh5_da.initialize(outlvl=outlvl, optarg=solver.options)
     m.fs.fwh5_da.drain.unfix()
 
@@ -944,35 +1052,34 @@ def initialize(m, fileinput=None, outlvl=idaeslog.NOTSET):
     #  High-pressure feedwater heaters                                        #
     ###########################################################################
     # fwh6
-    m.fs.fwh6_mix.drain.flow_mol.fix(5299)
-    m.fs.fwh6_mix.drain.pressure.fix(2177587)
-    m.fs.fwh6_mix.drain.enth_mol.fix(16559)
-    _set_port(m.fs.fwh6_mix.steam, m.fs.t3_splitter.outlet_2)
-    m.fs.fwh6_mix.initialize(outlvl=outlvl, optarg=solver.options)
-    m.fs.fwh6_mix.drain.unfix()
+    m.fs.fwh_mixers[6].drain.flow_mol.fix(5299)
+    m.fs.fwh_mixers[6].drain.pressure.fix(2177587)
+    m.fs.fwh_mixers[6].drain.enth_mol.fix(16559)
+    _set_port(m.fs.fwh_mixers[6].steam, m.fs.turbine_splitters[3].outlet_2)
+    m.fs.fwh_mixers[6].initialize(outlvl=outlvl, optarg=solver.options)
+    m.fs.fwh_mixers[6].drain.unfix()
 
-    _set_port(m.fs.fwh6.inlet_1, m.fs.fwh6_mix.outlet)
-    _set_port(m.fs.fwh6.inlet_2, m.fs.bfp.outlet)
-    m.fs.fwh6.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.fwh[6].inlet_1, m.fs.fwh_mixers[6].outlet)
+    _set_port(m.fs.fwh[6].inlet_2, m.fs.bfp.outlet)
+    m.fs.fwh[6].initialize(outlvl=outlvl, optarg=solver.options)
 
     # fwh7
-    _set_port(m.fs.fwh7_mix.steam, m.fs.t2_splitter.outlet_2)
-    m.fs.fwh7_mix.drain.flow_mol.fix(3730)
-    m.fs.fwh7_mix.drain.pressure.fix(5590711)
-    m.fs.fwh7_mix.drain.enth_mol.fix(21232)
+    _set_port(m.fs.fwh_mixers[7].steam, m.fs.turbine_splitters[2].outlet_2)
+    m.fs.fwh_mixers[7].drain.flow_mol.fix(3730)
+    m.fs.fwh_mixers[7].drain.pressure.fix(5590711)
+    m.fs.fwh_mixers[7].drain.enth_mol.fix(21232)
+    m.fs.fwh_mixers[7].initialize(outlvl=outlvl, optarg=solver.options)
+    m.fs.fwh_mixers[7].drain.unfix()
 
-    m.fs.fwh7_mix.initialize(outlvl=outlvl, optarg=solver.options)
-    m.fs.fwh7_mix.drain.unfix()
-
-    _set_port(m.fs.fwh7.inlet_1, m.fs.fwh7_mix.outlet)
-    _set_port(m.fs.fwh7.inlet_2, m.fs.fwh6.outlet_2)
-    m.fs.fwh7.initialize(outlvl=outlvl, optarg=solver.options)
+    _set_port(m.fs.fwh[7].inlet_1, m.fs.fwh_mixers[7].outlet)
+    _set_port(m.fs.fwh[7].inlet_2, m.fs.fwh[6].outlet_2)
+    m.fs.fwh[7].initialize(outlvl=outlvl, optarg=solver.options)
 
     # fwh8
-    _set_port(m.fs.fwh8.inlet_2, m.fs.fwh7.outlet_2)
-    _set_port(m.fs.fwh8.inlet_1, m.fs.t1_splitter.outlet_2)
-    m.fs.fwh8.initialize(outlvl=outlvl, optarg=solver.options)
-    m.fs.fwh8.inlet_1.unfix()
+    _set_port(m.fs.fwh[8].inlet_2, m.fs.fwh[7].outlet_2)
+    _set_port(m.fs.fwh[8].inlet_1, m.fs.turbine_splitters[1].outlet_2)
+    m.fs.fwh[8].initialize(outlvl=outlvl, optarg=solver.options)
+    m.fs.fwh[8].inlet_1.unfix()
 
     ###########################################################################
     #  Model Initialization with Square Problem Solve                         #
@@ -982,108 +1089,56 @@ def initialize(m, fileinput=None, outlvl=idaeslog.NOTSET):
     #  side outlet to be that of a saturated liquid
     # Then solve the square problem again for an initilized model
     # m.fs.turbine_1.split_fraction.unfix()
-    m.fs.t1_splitter.split_fraction[:, "outlet_2"].unfix()
-    m.fs.t2_splitter.split_fraction[:, "outlet_2"].unfix()
-    m.fs.t3_splitter.split_fraction[:, "outlet_2"].unfix()
-    m.fs.t4_splitter.split_fraction[:, "outlet_1"].unfix()
-    m.fs.t5_splitter.split_fraction[:, "outlet_2"].unfix()
-    m.fs.t6_splitter.split_fraction[:, "outlet_2"].unfix()
-    m.fs.t7_splitter.split_fraction[:, "outlet_2"].unfix()
-    m.fs.t8_splitter.split_fraction[:, "outlet_2"].unfix()
+    m.fs.turbine_splitters[1].split_fraction[:, "outlet_2"].unfix()
+    m.fs.turbine_splitters[2].split_fraction[:, "outlet_2"].unfix()
+    m.fs.turbine_splitters[3].split_fraction[:, "outlet_2"].unfix()
+    m.fs.turbine_splitters[4].split_fraction[:, "outlet_1"].unfix()
+    m.fs.turbine_splitters[5].split_fraction[:, "outlet_2"].unfix()
+    m.fs.turbine_splitters[6].split_fraction[:, "outlet_2"].unfix()
+    m.fs.turbine_splitters[7].split_fraction[:, "outlet_2"].unfix()
+    m.fs.turbine_splitters[8].split_fraction[:, "outlet_2"].unfix()
 
     m.fs.constraint_out_pressure.activate()
 
-    m.fs.fwh1.fwh1_vaporfrac_constraint.activate()
-    m.fs.fwh2.fwh2_vaporfrac_constraint.activate()
-    m.fs.fwh3.fwh3_vaporfrac_constraint.activate()
-    m.fs.fwh4.fwh4_vaporfrac_constraint.activate()
-    m.fs.fwh6.fwh6_vaporfrac_constraint.activate()
-    m.fs.fwh7.fwh7_vaporfrac_constraint.activate()
-    m.fs.fwh8.fwh8_vaporfrac_constraint.activate()
+    m.fs.fwh[1].fwh_vaporfrac_constraint.activate()
+    m.fs.fwh[2].fwh_vaporfrac_constraint.activate()
+    m.fs.fwh[3].fwh_vaporfrac_constraint.activate()
+    m.fs.fwh[4].fwh_vaporfrac_constraint.activate()
+    m.fs.fwh[6].fwh_vaporfrac_constraint.activate()
+    m.fs.fwh[7].fwh_vaporfrac_constraint.activate()
+    m.fs.fwh[8].fwh_vaporfrac_constraint.activate()
 
     res = solver.solve(m, tee=True)
     print("Model Initialization = ",
           res.solver.termination_condition)
     print("*********************Model Initialized**************************")
 
+    return solver
 
-def build_plant_model(initialize_from_file=None, store_initialization=None):
+def model_analysis(m, solver):
 
-    # Create a flowsheet, add properties, unit models, and arcs
-    m = create_model()
-
-    # Give all the required inputs to the model
-    # Ensure that the degrees of freedom = 0 (model is complete)
-    set_model_input(m)
-    # Assert that the model has no degree of freedom at this point
-    assert degrees_of_freedom(m) == 0
-
-    # Initialize the model (sequencial initialization and custom routines)
-    # Ensure after the model is initialized, the degrees of freedom = 0
-    initialize(m)
-    assert degrees_of_freedom(m) == 0
-
-    # The power plant with storage for a charge scenario is now ready
-    #  Declaraing a plant power out variable for easy analysis of various
-    #  design and operating scenarios
-    m.fs.plant_power_out = pyo.Var(
-        m.fs.time,
-        domain=pyo.Reals,
-        initialize=620,
-        doc="Net Power MWe out from the power plant"
-    )
-
-    #   Constraint on Plant Power Output
-    #   Plant Power Out = Turbine Power - Power required for HX Pump
-    @m.fs.Constraint(m.fs.time)
-    def production_cons(b, t):
-        return (
-            (-1*(m.fs.turbine_1.work_mechanical[t]
-                 + m.fs.turbine_2.work_mechanical[t]
-                 + m.fs.turbine_3.work_mechanical[t]
-                 + m.fs.turbine_4.work_mechanical[t]
-                 + m.fs.turbine_5.work_mechanical[t]
-                 + m.fs.turbine_6.work_mechanical[t]
-                 + m.fs.turbine_7.work_mechanical[t]
-                 + m.fs.turbine_8.work_mechanical[t]
-                 + m.fs.turbine_9.work_mechanical[t])
-             ) * 1e-6
-            == m.fs.plant_power_out[t]
-        )
-
-    return m
-
-
-def model_analysis(m):
-    solver = pyo.SolverFactory("ipopt")
-    solver.options = {
-        "tol": 1e-8,
-        "max_iter": 300,
-        "halt_on_ampl_error": "yes",
-    }
-
-#   Solving the flowsheet and check result
-#   At this time one can make chnages to the model for further analysis
+    # Solving the flowsheet and check result
+    # At this time one can make chnages to the model for further analysis
     solver.solve(m, tee=True, symbolic_solver_labels=True)
 
-    print('Total Power =', pyo.value(m.fs.plant_power_out[0]))
-    m.fs.fwh8.inlet_1.display()
-    m.fs.fwh8.inlet_2.display()
-    m.fs.fwh8.outlet_1.display()
-    m.fs.fwh8.outlet_2.display()
-
+    print('Total Power [MW]=', pyo.value(m.fs.plant_power_out[0]))
+    print('Total Heat Duty [MW]=', pyo.value(m.fs.plant_heat_duty[0]))
 
 if __name__ == "__main__":
     m = build_plant_model(initialize_from_file=None,
                           store_initialization=None)
-
+    
     #  At this point the model has 0 degrees of freedom
     #  A sensitivity analysis is done by varying the following variables
     #  1) Boiler feed water flow: m.fs.boiler.inlet.flow_mol[0]
     #  2) Steam flow to storage: m.fs.ess_split.split_fraction[:,"outlet_2"]
 
+    # Initialize the model (sequencial initialization and custom routines)
+    solver = initialize(m)
+
+    # Ensure after the model is initialized, the degrees of freedom = 0
+    assert degrees_of_freedom(m) == 0
+
     # User can import the model from build_plant_model for analysis
     # A sample analysis function is called below
-    model_analysis(m)
-
-    # m.fs.fwh7.pprint()
+    model_analysis(m, solver)
