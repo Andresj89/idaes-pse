@@ -29,7 +29,7 @@ The default values fixed in the model are from the NETL Baseline report rev4.
 
 """
 
-__author__ = "Naresh Susarla, Andres J Calderon, Miguel Zamarripa"
+__author__ = "Andres J Calderon, Naresh Susarla, Miguel Zamarripa"
 
 # Import Pyomo libraries
 import pyomo.environ as pyo
@@ -39,7 +39,7 @@ from pyomo.environ import units
 
 # Import IDAES libraries
 from idaes.core import FlowsheetBlock, MaterialBalanceType
-from idaes.core.util import copy_port_values as _set_port
+from idaes.core.util import get_solver, copy_port_values as _set_port
 # from idaes.core.util import get_solver
 from idaes.core.util.model_statistics import degrees_of_freedom
 from idaes.generic_models.unit_models import (
@@ -864,14 +864,14 @@ def build_plant_model(initialize_from_file=None, store_initialization=None):
 
 def initialize(m, fileinput=None, outlvl=idaeslog.NOTSET, solver=None, optarg=None):
 
-    solver = pyo.SolverFactory("ipopt")
-    solver.options = {
-        "tol": 1e-6,
-        "max_iter": 300,
-        "halt_on_ampl_error": "yes",
-    }
+    if optarg==None:
+        optarg = {
+            "tol": 1e-6,
+            "max_iter": 300,
+            "halt_on_ampl_error": "yes",
+        }
 
-    # solver = get_solver(solver, optarg)
+    solver = get_solver(solver, optarg)
 
     # initializing the boiler
     m.fs.boiler.inlet.pressure.fix(24657896)
